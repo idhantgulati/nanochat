@@ -110,7 +110,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
+    use_cuda = str(device).startswith("cuda")
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
@@ -164,3 +164,71 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0):
+    """
+    Infinite dataloader for pre-tokenized .pt files produced by prepare_data.py.
+
+    Handles DDP by assigning non-overlapping chunks to each rank. Yields
+    (inputs, targets, state_dict) where inputs/targets are (B, T) long tensors
+    and state_dict carries {chunk_idx, epoch} for resumption.
+
+    File format (written by prepare_data.py):
+        {
+            'chunks':       List[Tensor],   # each chunk: flat (B * (T+1),) uint16
+            'valid_counts': List[int],      # real sequences per chunk (last may be padded)
+            'batch_size':   int,            # B
+            'sequence_size': int,           # T+1
+        }
+    """
+    import os
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+
+    filename = "fineweb_train.pt" if split == "train" else "fineweb_val.pt"
+    filepath = os.path.join(data_dir, filename)
+    assert os.path.exists(filepath), (
+        f"Could not find {filepath}. Run `python prepare_data.py` first."
+    )
+
+    data = torch.load(filepath, weights_only=True)
+    chunks = data['chunks']           # list of flat uint16 tensors
+    valid_counts = data['valid_counts']
+    B = data['batch_size']
+    seq_size = data['sequence_size']  # T+1
+    T = seq_size - 1
+    num_chunks = len(chunks)
+
+    # Each rank takes every world_size-th chunk starting at its rank offset
+    rank_chunks = list(range(ddp_rank, num_chunks, ddp_world_size))
+    assert len(rank_chunks) > 0, (
+        f"Not enough chunks ({num_chunks}) for {ddp_world_size} ranks. "
+        "Generate more data with a larger --train_tokens / --val_tokens."
+    )
+
+    epoch = 1
+    chunk_idx = resume_chunk_idx  # global chunk index (before rank filtering)
+
+    use_cuda = str(device).startswith("cuda")
+    buf = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    inp_cpu = buf[:B * T].view(B, T)
+    tgt_cpu = buf[B * T:].view(B, T)
+    inp_gpu = torch.empty(B * T, dtype=torch.long, device=device).view(B, T)
+    tgt_gpu = torch.empty(B * T, dtype=torch.long, device=device).view(B, T)
+
+    while True:
+        for ci in rank_chunks:
+            if ci < chunk_idx and epoch == 1:
+                continue  # skip to resume point on first pass
+            chunk = chunks[ci].long().view(B, seq_size)
+            inp_cpu.copy_(chunk[:, :-1])
+            tgt_cpu.copy_(chunk[:, 1:])
+            if use_cuda:
+                inp_gpu.copy_(inp_cpu, non_blocking=True)
+                tgt_gpu.copy_(tgt_cpu, non_blocking=True)
+                yield inp_gpu, tgt_gpu, {"chunk_idx": ci, "epoch": epoch}
+            else:
+                yield inp_cpu.clone(), tgt_cpu.clone(), {"chunk_idx": ci, "epoch": epoch}
+            chunk_idx = ci + 1
+        epoch += 1
+        chunk_idx = 0  # reset so we cycle from the top next epoch

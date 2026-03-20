@@ -17,6 +17,7 @@ import gc
 import json
 import time
 import math
+import datetime
 import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
@@ -26,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit, pretokenized_distributed_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -77,6 +78,11 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Data source
+parser.add_argument("--data", type=str, default="climbmix", choices=["climbmix", "fineweb"],
+                    help="pretraining dataset: 'climbmix' (default Parquet pipeline) or 'fineweb' (pre-tokenized .pt from prepare_data.py)")
+parser.add_argument("--fineweb-data-dir", type=str, default="fineweb_data",
+                    help="directory containing fineweb_train.pt / fineweb_val.pt (default: fineweb_data)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -118,9 +124,27 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
-vocab_size = tokenizer.get_vocab_size()
+if args.data == "fineweb":
+    # FineWeb data was tokenized with GPT-2 (tiktoken) — use that directly,
+    # no need for the custom trained tokenizer pkl.
+    from nanochat.tokenizer import RustBPETokenizer as _RBPE
+    import tiktoken as _tiktoken
+    tokenizer = _RBPE.from_pretrained("gpt2")
+    _enc = _tiktoken.get_encoding("gpt2")
+    vocab_size = _enc.n_vocab  # 50257
+    _byte_lens = torch.zeros(vocab_size, dtype=torch.int32, device=device)
+    for _tid in range(vocab_size):
+        try:
+            _byte_lens[_tid] = len(_enc.decode_single_token_bytes(_tid))
+        except Exception:
+            _byte_lens[_tid] = 0  # special / unmapped tokens contribute 0 bytes
+    token_bytes = _byte_lens
+    print0(f"[fineweb] Using GPT-2 tokenizer (tiktoken), vocab_size={vocab_size:,}")
+else:
+    tokenizer = get_tokenizer()
+    token_bytes = get_token_bytes(device=device)
+    vocab_size = tokenizer.get_vocab_size()
+
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -327,8 +351,23 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+
+def _strip_state(gen):
+    """Yield only (inputs, targets), dropping the state_dict from pretokenized_distributed_loader."""
+    for x, y, _ in gen:
+        yield x, y
+
+if args.data == "fineweb":
+    import os as _os
+    _fw_dir = args.fineweb_data_dir if _os.path.isabs(args.fineweb_data_dir) else _os.path.join(get_base_dir(), args.fineweb_data_dir)
+    _resume_chunk = dataloader_resume_state_dict.get("chunk_idx", 0) if dataloader_resume_state_dict else 0
+    train_loader = pretokenized_distributed_loader(_fw_dir, split="train", device=device, resume_chunk_idx=_resume_chunk)
+    build_val_loader = lambda: _strip_state(pretokenized_distributed_loader(_fw_dir, split="val", device=device))
+    print0(f"[fineweb] Loading pre-tokenized data from: {_fw_dir}")
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -562,8 +601,12 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if 'pq_idx' in dataloader_state_dict:
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    else:
+        epoch = f"{dataloader_state_dict['epoch']} chunk: {dataloader_state_dict['chunk_idx']}"
+    wall_clock = datetime.datetime.now().strftime("%H:%M:%S")
+    print0(f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | elapsed: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
