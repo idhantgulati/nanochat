@@ -271,9 +271,9 @@ def main():
 
         for split_name in ["train", "val"]:
             loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
-            bpb = evaluate_bpb(model, loader, steps, token_bytes)
+            bpb, loss = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
-            print0(f"{split_name} bpb: {bpb:.6f}")
+            print0(f"{split_name} bpb: {bpb:.6f} | {split_name} loss: {loss:.6f}")
 
     # --- CORE evaluation ---
     if 'core' in eval_modes:

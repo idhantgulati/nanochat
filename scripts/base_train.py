@@ -76,8 +76,11 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--max-train-minutes", type=float, default=-1, help="stop training after this many minutes of pure training time (excludes val/save overhead), -1 = disable")
+parser.add_argument("--max-wall-minutes", type=float, default=-1, help="stop training after this many minutes of total wall-clock time (includes val/save overhead), -1 = disable")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--checkpoint-dir", type=str, default=None, help="override checkpoint directory (default: <base_dir>/base_checkpoints/<model_tag>)")
 # Data source
 parser.add_argument("--data", type=str, default="climbmix", choices=["climbmix", "fineweb"],
                     help="pretraining dataset: 'climbmix' (default Parquet pipeline) or 'fineweb' (pre-tokenized .pt from prepare_data.py)")
@@ -177,7 +180,10 @@ model.init_weights() # 3) All tensors get initialized
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+if args.checkpoint_dir:
+    checkpoint_dir = args.checkpoint_dir
+else:
+    checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -451,8 +457,11 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+t_loop_start = time.time()
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    train_time_exceeded = args.max_train_minutes > 0 and total_training_time / 60 >= args.max_train_minutes
+    wall_time_exceeded = args.max_wall_minutes > 0 and (time.time() - t_loop_start) / 60 >= args.max_wall_minutes
+    last_step = step == num_iterations or train_time_exceeded or wall_time_exceeded # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
@@ -461,8 +470,8 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f} | Validation loss: {val_loss:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
@@ -470,6 +479,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
+            "val/loss": val_loss,
         })
         model.train()
 
@@ -590,10 +600,10 @@ while True:
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
-    if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
-    # Calculate ETA based on average time per step (excluding first 10 steps)
-    steps_done = step - 10
+    if step > 0:
+        total_training_time += dt # only count the time after step 0 (which includes compilation)
+    # Calculate ETA based on average time per step (excluding step 0)
+    steps_done = step
     if steps_done > 0:
         avg_time_per_step = total_training_time / steps_done
         remaining_steps = num_iterations - step
@@ -606,12 +616,14 @@ while True:
     else:
         epoch = f"{dataloader_state_dict['epoch']} chunk: {dataloader_state_dict['chunk_idx']}"
     wall_clock = datetime.datetime.now().strftime("%H:%M:%S")
-    print0(f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | elapsed: {total_training_time/60:.2f}m{eta_str}")
+    wall_time = time.time() - t_loop_start
+    print0(f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | train: {total_training_time/60:.2f}m | wall: {wall_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "total_wall_time": time.time() - t_loop_start,
             "train/loss": debiased_smooth_loss,
             "train/lrm": lrm,
             "train/dt": dt,
@@ -636,8 +648,10 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
+total_wall_time = time.time() - t_loop_start
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
+print0(f"Total wall-clock time: {total_wall_time/60:.2f}m (overhead: {(total_wall_time - total_training_time)/60:.2f}m)")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
@@ -663,6 +677,8 @@ get_report().log(section="Base model training", data=[
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
+        "Total wall-clock time": f"{total_wall_time/60:.2f}m",
+        "Overhead (val/save/etc)": f"{(total_wall_time - total_training_time)/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
     }
 ])
