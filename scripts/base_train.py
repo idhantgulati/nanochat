@@ -86,6 +86,12 @@ parser.add_argument("--data", type=str, default="climbmix", choices=["climbmix",
                     help="pretraining dataset: 'climbmix' (default Parquet pipeline) or 'fineweb' (pre-tokenized .pt from prepare_data.py)")
 parser.add_argument("--fineweb-data-dir", type=str, default="fineweb_data",
                     help="directory containing fineweb_train.pt / fineweb_val.pt (default: fineweb_data)")
+# NCA pre-pre-training weight transfer
+parser.add_argument("--pre-pre-train-checkpoint", type=str, default=None,
+                    help="Path to NCA pre-pre-training checkpoint directory. "
+                         "All non-embedding weights (transformer blocks) will be transferred; "
+                         "vocab-dependent layers (wte, lm_head, value_embeds) are re-initialised "
+                         "for the language vocabulary. Example: ~/.cache/nanochat/nca_checkpoints/d20")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -176,6 +182,47 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+
+# If an NCA pre-pre-training checkpoint is provided, transfer non-embedding weights.
+# This follows the paper: transfer all transformer block weights; re-initialise the
+# vocab-dependent layers (wte, lm_head, value_embeds) for the language vocabulary.
+if args.pre_pre_train_checkpoint:
+    from nanochat.checkpoint_manager import find_last_step
+    ppt_dir = os.path.expanduser(args.pre_pre_train_checkpoint)
+    ppt_step = find_last_step(ppt_dir)
+    print0(f"Transferring NCA pre-pre-trained weights from: {ppt_dir} (step {ppt_step})")
+    nca_model_data, _, nca_meta = load_checkpoint(ppt_dir, ppt_step, device, load_optimizer=False)
+    # Strip torch.compile prefix if present
+    nca_model_data = {k.removeprefix("_orig_mod."): v for k, v in nca_model_data.items()}
+    # Convert BF16 weights to float on CPU/MPS for stable loading
+    if device.type in {"cpu", "mps"}:
+        nca_model_data = {k: v.float() if v.dtype == torch.bfloat16 else v
+                          for k, v in nca_model_data.items()}
+    # Identify vocab-dependent keys to skip (shape depends on vocab_size)
+    vocab_keys = {"transformer.wte.weight", "lm_head.weight"}
+    vocab_keys.update(k for k in nca_model_data if k.startswith("value_embeds."))
+    current_sd = model.state_dict()
+    transferred, skipped_vocab, skipped_shape = 0, 0, 0
+    with torch.no_grad():
+        for key, value in nca_model_data.items():
+            if key in vocab_keys:
+                skipped_vocab += 1
+                continue
+            if key not in current_sd:
+                skipped_shape += 1
+                continue
+            if value.shape != current_sd[key].shape:
+                print0(f"  Shape mismatch (skipping): {key} NCA={list(value.shape)} lang={list(current_sd[key].shape)}")
+                skipped_shape += 1
+                continue
+            current_sd[key].copy_(value)
+            transferred += 1
+    model.load_state_dict(current_sd, strict=True, assign=False)
+    del nca_model_data, current_sd
+    print0(f"  Transferred {transferred} tensors | "
+           f"skipped {skipped_vocab} vocab-dependent | {skipped_shape} shape mismatches")
+    nca_config = nca_meta.get("nca_config", {})
+    print0(f"  NCA training config: {nca_config}")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
