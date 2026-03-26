@@ -166,9 +166,8 @@ if "loss" in eval_modes:
             total_tokens_counted += x.numel()
 
     avg_loss = total_loss / eval_steps
-    # Convert to bits per patch token (analogous to BPB but for NCA tokens)
-    bits_per_token = avg_loss / math.log(2)
-    print0(f"NCA validation loss: {avg_loss:.6f} | bits/token: {bits_per_token:.4f}")
+    bpb = avg_loss / (math.log(2) * patch_size ** 2)
+    print0(f"NCA validation loss: {avg_loss:.6f} | bpb: {bpb:.4f}")
 
 # =============================================================================
 # Grid prediction accuracy evaluation

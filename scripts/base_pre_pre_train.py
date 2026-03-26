@@ -328,8 +328,9 @@ while True:
         val_loss = total_val_loss.item()
         if val_loss < min_val_loss:
             min_val_loss = val_loss
-        print0(f"Step {step:05d} | NCA val loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "val/loss": val_loss,
+        val_bpb = val_loss / (math.log(2) * args.patch_size ** 2)
+        print0(f"Step {step:05d} | NCA val loss: {val_loss:.6f} | bpb: {val_bpb:.4f}")
+        wandb_run.log({"step": step, "val/loss": val_loss, "val/bpb": val_bpb,
                        "total_training_time": total_training_time})
         orig_model.train()
 
@@ -427,9 +428,10 @@ while True:
         eta_str = ""
     wall_clock = datetime.datetime.now().strftime("%H:%M:%S")
     wall_time = time.time() - t_loop_start
+    train_bpb = debiased / (math.log(2) * args.patch_size ** 2)
     print0(
         f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | "
-        f"loss: {debiased:.6f} | lrm: {lrm:.3f} | dt: {dt*1000:.1f}ms | "
+        f"loss: {debiased:.6f} | bpb: {train_bpb:.4f} | lrm: {lrm:.3f} | dt: {dt*1000:.1f}ms | "
         f"tok/sec: {tok_per_sec:,} | train: {total_training_time/60:.1f}m | "
         f"wall: {wall_time/60:.1f}m{eta_str}"
     )
@@ -438,6 +440,7 @@ while True:
             "step": step,
             "total_training_time": total_training_time,
             "train/loss": debiased,
+            "train/bpb": train_bpb,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
