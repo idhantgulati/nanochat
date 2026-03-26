@@ -235,15 +235,17 @@ assert total_batch_size % world_tokens_per_fwdbwd == 0, (
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 if args.tokens_per_epoch > 0 and args.num_epochs > 0:
     # Epoch mode: fixed dataset, looped num_epochs times
-    total_tokens   = args.tokens_per_epoch * args.num_epochs
-    num_iterations = total_tokens // total_batch_size
-    total_tokens   = total_batch_size * num_iterations  # snap to batch boundary
-    num_train_seqs = math.ceil(args.tokens_per_epoch / args.max_seq_len)
+    total_tokens    = args.tokens_per_epoch * args.num_epochs
+    num_iterations  = total_tokens // total_batch_size
+    total_tokens    = total_batch_size * num_iterations  # snap to batch boundary
+    num_train_seqs  = math.ceil(args.tokens_per_epoch / args.max_seq_len)
+    steps_per_epoch = args.tokens_per_epoch // total_batch_size
 else:
     # Default mode: total_tokens drives everything (~1 epoch)
-    num_iterations = args.total_tokens // total_batch_size
-    total_tokens   = total_batch_size * num_iterations
-    num_train_seqs = math.ceil(total_tokens / args.max_seq_len)
+    num_iterations  = args.total_tokens // total_batch_size
+    total_tokens    = total_batch_size * num_iterations
+    num_train_seqs  = math.ceil(total_tokens / args.max_seq_len)
+    steps_per_epoch = None
 
 print0(f"NCA pre-pre-training: {total_tokens:,} tokens over {num_iterations:,} steps")
 if args.tokens_per_epoch > 0 and args.num_epochs > 0:
@@ -343,9 +345,10 @@ while True:
         if val_loss < min_val_loss:
             min_val_loss = val_loss
         val_bpb = val_loss / (math.log(2) * args.patch_size ** 2)
-        print0(f"Step {step:05d} | NCA val loss: {val_loss:.6f} | bpb: {val_bpb:.4f}")
+        print0(f"Step {step:05d} | NCA val loss: {val_loss:.6f} | bpb: {val_bpb:.6f}")
         wandb_run.log({"step": step, "val/loss": val_loss, "val/bpb": val_bpb,
-                       "total_training_time": total_training_time})
+                       "total_training_time": total_training_time,
+                       "total_training_flops": flops_so_far})
         orig_model.train()
 
     # ------------------------------------------------------------------
@@ -443,21 +446,27 @@ while True:
     wall_clock = datetime.datetime.now().strftime("%H:%M:%S")
     wall_time = time.time() - t_loop_start
     train_bpb = debiased / (math.log(2) * args.patch_size ** 2)
+    flops_per_sec = orig_model.estimate_flops() * total_batch_size / dt
+    mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
+    epoch_str = f" | epoch: {step // steps_per_epoch + 1}/{args.num_epochs}" if steps_per_epoch else ""
     print0(
-        f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | "
-        f"loss: {debiased:.6f} | bpb: {train_bpb:.4f} | lrm: {lrm:.3f} | dt: {dt*1000:.1f}ms | "
-        f"tok/sec: {tok_per_sec:,} | train: {total_training_time/60:.1f}m | "
-        f"wall: {wall_time/60:.1f}m{eta_str}"
+        f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%){epoch_str} | "
+        f"loss: {debiased:.6f} | bpb: {train_bpb:.4f} | lrm: {lrm:.2f} | dt: {dt*1000:.2f}ms | "
+        f"tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | train: {total_training_time/60:.2f}m | "
+        f"wall: {wall_time/60:.2f}m{eta_str}"
     )
-    if step % 10 == 0:
+    if step % 100 == 0:
         wandb_run.log({
             "step": step,
+            "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
+            "total_wall_time": wall_time,
             "train/loss": debiased,
             "train/bpb": train_bpb,
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
+            "train/mfu": mfu,
         })
 
     first_step = (step == 0) or (resuming and step == args.resume_from_step)
