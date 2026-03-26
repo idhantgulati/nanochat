@@ -166,7 +166,7 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
         yield inputs, targets
 
 
-def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0):
+def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0, shuffle_epochs=False):
     """
     Infinite dataloader for pre-tokenized .pt files produced by prepare_data.py.
 
@@ -216,8 +216,14 @@ def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0)
     inp_gpu = torch.empty(B * T, dtype=torch.long, device=device).view(B, T)
     tgt_gpu = torch.empty(B * T, dtype=torch.long, device=device).view(B, T)
 
+    import random as _random
     while True:
-        for ci in rank_chunks:
+        epoch_chunks = rank_chunks[:]
+        if shuffle_epochs and epoch > 1:
+            # Shuffle chunk order every epoch after the first (deterministic per epoch+rank seed)
+            _rng = _random.Random(epoch * 1000 + ddp_rank)
+            _rng.shuffle(epoch_chunks)
+        for ci in epoch_chunks:
             if ci < chunk_idx and epoch == 1:
                 continue  # skip to resume point on first pass
             chunk = chunks[ci].long().view(B, seq_size)

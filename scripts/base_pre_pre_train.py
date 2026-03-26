@@ -67,6 +67,8 @@ parser.add_argument("--head-dim",       type=int,   default=128,   help="target 
 parser.add_argument("--max-seq-len",    type=int,   default=1024,  help="context length (paper uses 1024)")
 parser.add_argument("--window-pattern", type=str,   default="SSSL",
                     help="sliding window attention pattern (L=full, S=quarter context)")
+parser.add_argument("--dropout",        type=float, default=0.0,
+                    help="residual dropout applied after each sub-layer (NCA data is synthetic so 0 is fine; set >0 for fixed-dataset multi-epoch runs)")
 # Training horizon
 parser.add_argument("--total-tokens",     type=int, default=10_000_000,
                     help="total NCA training tokens (default: 10M)")
@@ -82,7 +84,7 @@ parser.add_argument("--matrix-lr",         type=float, default=0.02, help="Muon 
 parser.add_argument("--embedding-lr",      type=float, default=0.2,  help="AdamW LR for embeddings")
 parser.add_argument("--unembedding-lr",    type=float, default=0.004,help="AdamW LR for lm_head")
 parser.add_argument("--scalar-lr",         type=float, default=0.5,  help="AdamW LR for scalars")
-parser.add_argument("--weight-decay",      type=float, default=0.0,  help="weight decay (paper: 0)")
+parser.add_argument("--weight-decay",      type=float, default=0.0,  help="weight decay passed directly to optimizer (no scaling formula; paper recommendation: 0 for NCA synthetic data)")
 parser.add_argument("--warmup-steps",      type=int,   default=61,
                     help="LR warmup steps (~10%% of total; 61 for the 10M token default)")
 parser.add_argument("--warmdown-ratio",    type=float, default=0.65,
@@ -176,6 +178,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        dropout=args.dropout,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -207,7 +210,8 @@ orig_model = model
 model = torch.compile(model, dynamic=False)
 
 # -----------------------------------------------------------------------------
-# Optimizer: Muon+AdamW with weight_decay=0 (paper recommendation)
+# Optimizer: Muon+AdamW with weight_decay=0 (paper recommendation for NCA synthetic data)
+# Note: --weight-decay arg is intentionally ignored here; NCA data is freshly generated so no overfitting regularization needed.
 optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,

@@ -53,6 +53,8 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--dropout", type=float, default=0.0, help="residual dropout applied after each sub-layer (0.1 recommended for multi-epoch / fixed-data training)")
+parser.add_argument("--shuffle-epochs", action="store_true", default=False, help="shuffle fineweb chunk order every epoch after the first (slowrun PR #2 improvement)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -62,7 +64,8 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="weight decay input — scaled by T_epoch formula (λ = input × √(B/B_ref) × D_ref/D)")
+parser.add_argument("--weight-decay-eff", type=float, default=-1.0, help="effective weight decay passed directly to optimizer, bypassing the T_epoch scaling formula (-1 = disabled)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
@@ -170,6 +173,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        dropout=args.dropout,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -375,9 +379,16 @@ if batch_ratio != 1.0:
 # Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
 # λ = λ_ref · √(B/B_ref) · (D_ref/D)
 # Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
-weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
-if weight_decay_scaled != args.weight_decay:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
+if args.weight_decay_eff != -1.0 and args.weight_decay != 0.28:
+    print0(f"WARNING: both --weight-decay and --weight-decay-eff were given; ignoring --weight-decay-eff and using --weight-decay (scaled)")
+if args.weight_decay_eff != -1.0 and args.weight_decay == 0.28:
+    # --weight-decay-eff provided and --weight-decay is at its default: bypass scaling entirely
+    weight_decay_scaled = args.weight_decay_eff
+    print0(f"Weight decay (effective, no scaling): {weight_decay_scaled:.6f}")
+else:
+    weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+    if weight_decay_scaled != args.weight_decay:
+        print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
@@ -414,7 +425,7 @@ if args.data == "fineweb":
     import os as _os
     _fw_dir = args.fineweb_data_dir if _os.path.isabs(args.fineweb_data_dir) else _os.path.join(get_base_dir(), args.fineweb_data_dir)
     _resume_chunk = dataloader_resume_state_dict.get("chunk_idx", 0) if dataloader_resume_state_dict else 0
-    train_loader = pretokenized_distributed_loader(_fw_dir, split="train", device=device, resume_chunk_idx=_resume_chunk)
+    train_loader = pretokenized_distributed_loader(_fw_dir, split="train", device=device, resume_chunk_idx=_resume_chunk, shuffle_epochs=args.shuffle_epochs)
     build_val_loader = lambda: _strip_state(pretokenized_distributed_loader(_fw_dir, split="val", device=device))
     print0(f"[fineweb] Loading pre-tokenized data from: {_fw_dir}")
 else:
@@ -665,7 +676,7 @@ while True:
     wall_clock = datetime.datetime.now().strftime("%H:%M:%S")
     wall_time = time.time() - t_loop_start
     print0(f"[{wall_clock}] step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | train: {total_training_time/60:.2f}m | wall: {wall_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    if step % 10 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,

@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    dropout: float = 0.0  # residual dropout applied after each sub-layer; 0.1 recommended for multi-epoch training
 
 
 def norm(x):
@@ -144,10 +145,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.resid_drop = nn.Dropout(config.dropout) if config.dropout > 0.0 else nn.Identity()
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + self.resid_drop(self.attn(norm(x), ve, cos_sin, window_size, kv_cache))
+        x = x + self.resid_drop(self.mlp(norm(x)))
         return x
 
 

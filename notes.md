@@ -4,6 +4,25 @@ Challenge: fixed 100M tokens FineWeb, 8xH100, 1hr time limit, minimize val loss.
 Training runs for 12 epochs (1.2B total tokens seen).
 Steps = 1.2B / 524,288 batch = 2,289 optimizer steps.
 
+## Regularization findings from slowrun
+
+Multi-epoch training on a fixed 100M token dataset causes heavy overfitting without regularization.
+The first baseline run (no dropout) peaked at val loss ~3.70 at step 500, then rose to ~6.86 by end.
+Slowrun achieves val loss 3.40 with dropout=0.1 (their *baseline* includes this).
+
+**What is in the baseline vs what is an improvement:**
+
+| Change | Part of baseline? | Expected impact |
+|---|---|---|
+| `--dropout=0.1` | Yes — slowrun baseline includes it | Big: 3.70 → ~3.40 |
+| `--shuffle-epochs` | No — slowrun PR #2 improvement | ~3.40 → ~3.38 |
+
+Code changes made to nanochat to support these:
+- **`gpt.py`**: Added `dropout` field to `GPTConfig`. `Block` applies residual dropout after
+  each sub-layer (attention and MLP). Inactive when `dropout=0.0` (default).
+- **`dataloader.py`**: `pretokenized_distributed_loader` accepts `shuffle_epochs=True` to
+  shuffle chunk order each epoch after the first. Controlled via `--shuffle-epochs` flag.
+
 ## Step 1: Prepare data
 
 ```bash
@@ -15,9 +34,10 @@ python prepare_data.py
 ## Step 2: Train
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
+WANDB_MODE=online torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --run=slowrun-baseline \
     --model-tag=slowrun-baseline \
+    --checkpoint-dir=baseline_checkpoints \
     \
     --depth=30 \
     --aspect-ratio=59 \
@@ -26,7 +46,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --window-pattern=SSSL \
     \
     --data=fineweb \
-    --fineweb-data-dir=fineweb_data \
+    --fineweb-data-dir /root/slow-gpt/nanochat/fineweb_data \
     \
     --num-iterations=2289 \
     --device-batch-size=4 \
@@ -36,18 +56,21 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --scalar-lr=0.025 \
     --embedding-lr=0.0375 \
     --unembedding-lr=0.0005 \
-    --weight-decay=1.3 \
+    --weight-decay-eff=1.6 \
     \
     --warmup-steps=0 \
     --warmdown-ratio=0.2 \
     --final-lr-frac=0.0 \
     \
-    --eval-every=250 \
+    --dropout=0.1 \
+    \
+    --eval-every=100 \
     --eval-tokens=10000000 \
     --core-metric-every=-1 \
     --sample-every=-1 \
-    --save-every=-1 \
-    --max-train-minutes=60
+    --save-every=500 \
+    --max-train-minutes=60 \
+    --checkpoint-dir=/root/slow-gpt/nanochat/checkpoints/baseline
 ```
 
 Model: depth=30, aspect-ratio=59 → base_dim=1770, n_embd=ceil(1770/128)*128=1792, n_head=14.
@@ -56,6 +79,14 @@ Matches slowrun's n_layer=30, n_embd=1792, n_head=14 (~2.7B parameter model).
 LRs are slowrun's effective values after its internal `lr_multiplier=0.25`
 (slowrun raw: matrix=0.04, scalar=0.1, embed=0.15, unembed=0.002).
 dmodel_lr_scale is bypassed in gpt.py so these values reach the optimizer unchanged.
+
+Weight decay: use `--weight-decay-eff=1.3` to bypass nanochat's T_epoch scaling formula and
+pass 1.6 directly to the optimizer (matching slowrun's original baseline that achieved 3.402).
+Using `--weight-decay=1.6` instead would silently scale it down to ~0.159 (10× too small for the data-constrained regime).
+The cosine decay schedule still applies on top of whichever value is used.
+
+Warmdown ratio 0.2: slowrun's original baseline used 0.4, but PR #41 ("halve LRs for AdamW,
+halve warmdown ratio") improved the record. 0.2 is the current best practice.
 
 
 
@@ -106,14 +137,15 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_pre_pre_train \
     --warmdown-ratio=0.1 \
     --eval-every=100 \
     --save-every=610 \
-    --num-rules=5000
+    --num-rules=5000 \
+    --checkpoint-dir=nca_checkpoints/pre_pre_training_checkpoints
 ```
 
 NOTE: device-batch-size=2 (not 16) is required for 8 GPUs.
 world_tokens_per_step = device_batch_size × seq_len × world_size = 2 × 1024 × 8 = 16384 = total_batch_size. grad_accum=1.
 Using device-batch-size=16 with total-batch-size=16384 triggers an assertion error (16384 % 131072 ≠ 0).
 
-Training budget: ~610 steps (10M / 16384). Checkpoints saved to `~/.cache/nanochat/nca_checkpoints/d30/`.
+Training budget: ~610 steps (10M / 16384). Checkpoints saved to `nca_checkpoints/pre_pre_training_checkpoints/`.
 
 ### Step 2: Evaluate NCA model
 
@@ -139,10 +171,11 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --max-seq-len=2048 \
     --window-pattern=SSSL \
     \
-    --pre-pre-train-checkpoint=~/.cache/nanochat/nca_checkpoints/d30 \
+    --pre-pre-train-checkpoint=nca_checkpoints/pre_pre_training_checkpoints \
+    --checkpoint-dir=nca_checkpoints/pre_training_checkpoints \
     \
     --data=fineweb \
-    --fineweb-data-dir=fineweb_data \
+    --fineweb-data-dir /root/slow-gpt/nanochat/fineweb_data \
     \
     --num-iterations=2289 \
     --device-batch-size=4 \
@@ -152,11 +185,13 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --scalar-lr=0.025 \
     --embedding-lr=0.0375 \
     --unembedding-lr=0.0005 \
-    --weight-decay=1.3 \
+    --weight-decay-eff=1.6 \
     \
     --warmup-steps=0 \
     --warmdown-ratio=0.2 \
     --final-lr-frac=0.0 \
+    \
+    --dropout=0.1 \
     \
     --eval-every=250 \
     --eval-tokens=10000000 \
@@ -193,5 +228,5 @@ python -m scripts.base_pre_pre_eval --model-tag=d4 --eval=loss,accuracy --num-ru
 python -m scripts.base_train \
     --depth=4 --max-seq-len=512 --device-batch-size=1 \
     --total-batch-size=512 --num-iterations=5 \
-    --pre-pre-train-checkpoint=~/.cache/nanochat/nca_checkpoints/d4
+    --pre-pre-train-checkpoint=nca_checkpoints/pre_pre_training_checkpoints
 ```
