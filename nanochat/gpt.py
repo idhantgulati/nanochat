@@ -453,11 +453,16 @@ class GPT(nn.Module):
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
         use_ckpt = self.config.use_gradient_checkpointing and self.training and kv_cache is None
+        # _gc_compiled_blocks is injected by base_train.py when --gradient-checkpointing is set.
+        # Using per-block compiled callables lets inductor optimise each block while keeping the
+        # checkpoint boundaries opaque to the outer graph (torch.compile(model) would inline through them).
+        gc_blocks = self.__dict__.get('_gc_compiled_blocks')
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             if use_ckpt:
-                x = gradient_checkpoint(block, x, ve, cos_sin, self.window_sizes[i], None, use_reentrant=False)
+                fn = gc_blocks[i] if gc_blocks is not None else block
+                x = gradient_checkpoint(fn, x, ve, cos_sin, self.window_sizes[i], None, use_reentrant=False)
             else:
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:

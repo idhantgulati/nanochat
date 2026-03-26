@@ -327,10 +327,13 @@ def disable_fp8(model):
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 if args.gradient_checkpointing:
-    # torch.compile traces through gradient_checkpoint boundaries and eliminates the memory savings.
-    # Skipping compile preserves the checkpoint semantics; the ~30% speed gain from compile is
-    # roughly offset by the ~33% extra compute from recomputation anyway.
-    print0("Gradient checkpointing enabled: skipping torch.compile to preserve activation memory savings")
+    # torch.compile(model) traces through gradient_checkpoint boundaries and eliminates memory savings.
+    # Instead, compile each block individually — inductor optimises the inner ops while the outer
+    # graph never sees inside the checkpoint, so activation memory is actually freed.
+    # Parameters are shared objects so DDP gradient sync is unaffected.
+    print0("Gradient checkpointing: compiling blocks individually to preserve checkpoint boundaries...")
+    _gc_compiled = [torch.compile(b, dynamic=False) for b in orig_model.transformer.h]
+    orig_model.__dict__['_gc_compiled_blocks'] = _gc_compiled
     model = orig_model
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
