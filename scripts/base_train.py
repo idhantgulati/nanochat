@@ -54,6 +54,7 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--dropout", type=float, default=0.0, help="residual dropout applied after each sub-layer (0.1 recommended for multi-epoch / fixed-data training)")
+parser.add_argument("--gradient-checkpointing", action="store_true", default=False, help="recompute activations during backward to save ~30 GiB memory at ~33%% extra compute; needed when --dropout causes OOM on H100")
 parser.add_argument("--shuffle-epochs", action="store_true", default=False, help="shuffle fineweb chunk order every epoch after the first (slowrun PR #2 improvement)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -174,6 +175,7 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         dropout=args.dropout,
+        use_gradient_checkpointing=args.gradient_checkpointing,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

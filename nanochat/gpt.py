@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
@@ -38,6 +39,7 @@ class GPTConfig:
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
     dropout: float = 0.0  # residual dropout applied after each sub-layer; 0.1 recommended for multi-epoch training
+    use_gradient_checkpointing: bool = False  # trade ~33% compute for ~30 GiB less activation memory; needed when dropout causes OOM
 
 
 def norm(x):
@@ -450,10 +452,14 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        use_ckpt = self.config.use_gradient_checkpointing and self.training and kv_cache is None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if use_ckpt:
+                x = gradient_checkpoint(block, x, ve, cos_sin, self.window_sizes[i], None, use_reentrant=False)
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

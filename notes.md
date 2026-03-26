@@ -63,6 +63,7 @@ WANDB_MODE=online torchrun --standalone --nproc_per_node=8 -m scripts.base_train
     --final-lr-frac=0.0 \
     \
     --dropout=0.1 \
+    --gradient-checkpointing \
     \
     --eval-every=100 \
     --eval-tokens=10000000 \
@@ -87,6 +88,15 @@ The cosine decay schedule still applies on top of whichever value is used.
 
 Warmdown ratio 0.2: slowrun's original baseline used 0.4, but PR #41 ("halve LRs for AdamW,
 halve warmdown ratio") improved the record. 0.2 is the current best practice.
+
+Gradient checkpointing (`--gradient-checkpointing`): required when running dropout=0.1 on 8×H100.
+Without it, dropout causes inductor to store ~44 GiB of activations (vs ~13 GiB without dropout),
+and a fixed (32768, 50257) float32 intermediate in the CE backward (~6 GiB) causes OOM.
+Gradient checkpointing recomputes each block's forward during backward instead of caching activations,
+saving ~30 GiB at ~33% extra compute. The 33% extra compute costs ≈10-20% wall-clock time in practice
+because H100s are compute-fast relative to memory bandwidth.
+`logits.float()` in gpt.py is the root cause of the large intermediate — slowrun avoids it by using
+`torch.autocast` (stays bf16 throughout), but nanochat's explicit cast is harder to remove.
 
 
 
@@ -192,6 +202,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --final-lr-frac=0.0 \
     \
     --dropout=0.1 \
+    --gradient-checkpointing \
     \
     --eval-every=250 \
     --eval-tokens=10000000 \
