@@ -7,7 +7,7 @@ Steps = 1.2B / 524,288 batch = 2,289 optimizer steps.
 ## Step 1: Prepare data
 
 ```bash
-python prepapre_data.py
+python prepare_data.py
 # produces fineweb_data/fineweb_train.pt (100M tokens) and fineweb_val.pt (10M tokens)
 # uses GPT-2 tokenizer (vocab 50,257) — same script as slowrun/prepare_data.py
 ```
