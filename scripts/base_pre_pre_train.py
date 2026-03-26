@@ -72,6 +72,10 @@ parser.add_argument("--total-tokens",     type=int, default=10_000_000,
                     help="total NCA training tokens (default: 10M)")
 parser.add_argument("--total-batch-size", type=int, default=16384,
                     help="total batch size in tokens per step (paper: 16 seqs x 1024 = 16384)")
+parser.add_argument("--tokens-per-epoch", type=int, default=-1,
+                    help="tokens per epoch for fixed-dataset multi-epoch training (-1 = disabled)")
+parser.add_argument("--num-epochs",       type=int, default=-1,
+                    help="number of epochs over the fixed dataset (-1 = disabled)")
 # Optimisation
 parser.add_argument("--device-batch-size", type=int,   default=16,   help="per-device batch size in sequences")
 parser.add_argument("--matrix-lr",         type=float, default=0.02, help="Muon LR for matrix params")
@@ -229,16 +233,26 @@ assert total_batch_size % world_tokens_per_fwdbwd == 0, (
     f"Adjust --device-batch-size or --total-batch-size."
 )
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-num_iterations   = args.total_tokens // total_batch_size
-total_tokens     = total_batch_size * num_iterations
+if args.tokens_per_epoch > 0 and args.num_epochs > 0:
+    # Epoch mode: fixed dataset, looped num_epochs times
+    total_tokens   = args.tokens_per_epoch * args.num_epochs
+    num_iterations = total_tokens // total_batch_size
+    total_tokens   = total_batch_size * num_iterations  # snap to batch boundary
+    num_train_seqs = math.ceil(args.tokens_per_epoch / args.max_seq_len)
+else:
+    # Default mode: total_tokens drives everything (~1 epoch)
+    num_iterations = args.total_tokens // total_batch_size
+    total_tokens   = total_batch_size * num_iterations
+    num_train_seqs = math.ceil(total_tokens / args.max_seq_len)
 
 print0(f"NCA pre-pre-training: {total_tokens:,} tokens over {num_iterations:,} steps")
+if args.tokens_per_epoch > 0 and args.num_epochs > 0:
+    print0(f"Epoch mode: {num_train_seqs:,} sequences/epoch x {args.num_epochs} epochs")
 print0(f"Batch: {args.device_batch_size} seqs x {args.max_seq_len} tokens x "
        f"{ddp_world_size} ranks x {grad_accum_steps} accum = {total_batch_size:,} tokens/step")
 
 # -----------------------------------------------------------------------------
 # Generate NCA training and validation data
-num_train_seqs = math.ceil(total_tokens    / args.max_seq_len)
 num_val_seqs   = math.ceil(args.eval_tokens / args.max_seq_len)
 
 nca_kwargs = dict(
