@@ -166,13 +166,17 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
         yield inputs, targets
 
 
-def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0, shuffle_epochs=False):
+def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0, shuffle_epochs=False, device_batch_size=None):
     """
     Infinite dataloader for pre-tokenized .pt files produced by prepare_data.py.
 
     Handles DDP by assigning non-overlapping chunks to each rank. Yields
     (inputs, targets, state_dict) where inputs/targets are (B, T) long tensors
     and state_dict carries {chunk_idx, epoch} for resumption.
+
+    If device_batch_size is given and smaller than the file's batch_size,
+    each chunk is split into sub-batches so that the yielded B matches
+    device_batch_size. This keeps per-micro-step activation memory predictable.
 
     File format (written by prepare_data.py):
         {
@@ -194,10 +198,18 @@ def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0,
     data = torch.load(filepath, weights_only=True)
     chunks = data['chunks']           # list of flat uint16 tensors
     valid_counts = data['valid_counts']
-    B = data['batch_size']
+    B_data = data['batch_size']
     seq_size = data['sequence_size']  # T+1
     T = seq_size - 1
     num_chunks = len(chunks)
+
+    # Determine the yielded batch size
+    B = device_batch_size if device_batch_size is not None else B_data
+    assert B_data % B == 0, (
+        f"Pre-tokenized batch_size ({B_data}) must be divisible by "
+        f"device_batch_size ({B}). Re-run prepare_data.py or choose a compatible value."
+    )
+    sub_batches = B_data // B  # how many yields per chunk
 
     # Each rank takes every world_size-th chunk starting at its rank offset
     rank_chunks = list(range(ddp_rank, num_chunks, ddp_world_size))
@@ -226,15 +238,17 @@ def pretokenized_distributed_loader(data_dir, split, device, resume_chunk_idx=0,
         for ci in epoch_chunks:
             if ci < chunk_idx and epoch == 1:
                 continue  # skip to resume point on first pass
-            chunk = chunks[ci].long().view(B, seq_size)
-            inp_cpu.copy_(chunk[:, :-1])
-            tgt_cpu.copy_(chunk[:, 1:])
-            if use_cuda:
-                inp_gpu.copy_(inp_cpu, non_blocking=True)
-                tgt_gpu.copy_(tgt_cpu, non_blocking=True)
-                yield inp_gpu, tgt_gpu, {"chunk_idx": ci, "epoch": epoch}
-            else:
-                yield inp_cpu.clone(), tgt_cpu.clone(), {"chunk_idx": ci, "epoch": epoch}
+            chunk = chunks[ci].long().view(B_data, seq_size)
+            for sb in range(sub_batches):
+                start = sb * B
+                inp_cpu.copy_(chunk[start:start + B, :-1])
+                tgt_cpu.copy_(chunk[start:start + B, 1:])
+                if use_cuda:
+                    inp_gpu.copy_(inp_cpu, non_blocking=True)
+                    tgt_gpu.copy_(tgt_cpu, non_blocking=True)
+                    yield inp_gpu, tgt_gpu, {"chunk_idx": ci, "epoch": epoch}
+                else:
+                    yield inp_cpu.clone(), tgt_cpu.clone(), {"chunk_idx": ci, "epoch": epoch}
             chunk_idx = ci + 1
         epoch += 1
         chunk_idx = 0  # reset so we cycle from the top next epoch

@@ -438,8 +438,8 @@ if args.data == "fineweb":
     import os as _os
     _fw_dir = args.fineweb_data_dir if _os.path.isabs(args.fineweb_data_dir) else _os.path.join(get_base_dir(), args.fineweb_data_dir)
     _resume_chunk = dataloader_resume_state_dict.get("chunk_idx", 0) if dataloader_resume_state_dict else 0
-    train_loader = pretokenized_distributed_loader(_fw_dir, split="train", device=device, resume_chunk_idx=_resume_chunk, shuffle_epochs=args.shuffle_epochs)
-    build_val_loader = lambda: _strip_state(pretokenized_distributed_loader(_fw_dir, split="val", device=device))
+    train_loader = pretokenized_distributed_loader(_fw_dir, split="train", device=device, resume_chunk_idx=_resume_chunk, shuffle_epochs=args.shuffle_epochs, device_batch_size=args.device_batch_size)
+    build_val_loader = lambda: _strip_state(pretokenized_distributed_loader(_fw_dir, split="val", device=device, device_batch_size=args.device_batch_size))
     print0(f"[fineweb] Loading pre-tokenized data from: {_fw_dir}")
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
